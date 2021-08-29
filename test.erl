@@ -32,14 +32,12 @@ encode_name(TextDomain) ->
               | 'MX'
               | 'TXT'
               | 'TSIG'
+              | 'AXFR'
+              | 'MAILB'
+              | 'MAILA'
+              | '*'
               | 0..16#ffff
               | <<_:16>>.
-
--type qtype() :: 'AXFR'
-               | 'MAILB'
-               | 'MAILA'
-               | '*'
-               | type().
 
 -spec encode_type(type()) -> <<_:16>>.
 
@@ -60,31 +58,29 @@ encode_type('MINFO') -> <<14:16>>;
 encode_type('MX')    -> <<15:16>>;
 encode_type('TXT')   -> <<16:16>>;
 encode_type('TSIG')  -> <<250:16>>;
+encode_type('AXFR')  -> <<252:16>>;
+encode_type('MAILB') -> <<253:16>>;
+encode_type('MAILA') -> <<254:16>>;
+encode_type('*')     -> <<255:16>>;
 encode_type(B) when is_binary(B) -> B;
 encode_type(I) when is_integer(I) -> <<I:16>>.
 
--spec encode_qtype(qtype()) -> <<_:16>>.
-
-encode_qtype('AXFR')  -> <<252:16>>;
-encode_qtype('MAILB') -> <<253:16>>;
-encode_qtype('MAILA') -> <<254:16>>;
-encode_qtype('*')     -> <<255:16>>;
-encode_qtype(Type)    -> encode_type(Type).
-
 -type class() :: 'IN'
-               | '*'.
+               | '*'
+               | 'NONE'.
 
 -spec encode_class(class()) -> <<_:16>>.
 
 encode_class('IN') -> <<1:16>>;
-encode_class('*') -> <<255:16>>.
+encode_class('*') -> <<255:16>>;
+encode_class('NONE') -> <<254:16>>.
 
--type question() :: {name(), qtype(), class()}.
+-type question() :: {name(), type(), class()}.
 
 -spec encode_question(question()) -> iodata().
 
-encode_question({Name, Qtype, Class}) ->
-    [encode_name(Name), encode_qtype(Qtype), encode_class(Class)].
+encode_question({Name, Type, Class}) ->
+    [encode_name(Name), encode_type(Type), encode_class(Class)].
 
 -type resource_record() :: {name(), type(), class(), 0..16#ffffffff, binary()}.
 
@@ -126,7 +122,6 @@ encode_message({QueryId, IsResponse, OpCode, IsAuthorative, IsTruncated,
        0:3,
        Rcode:4>>,
 
-
      <<QuestionCount:16,
        AnswerCount:16,
        AuthorityCount:16,
@@ -136,6 +131,8 @@ encode_message({QueryId, IsResponse, OpCode, IsAuthorative, IsTruncated,
      [encode_resource_record(Ans) || Ans <- Answers],
      [encode_resource_record(Auth) || Auth <- Authority],
      [encode_resource_record(Addi) || Addi <- Additional]].
+
+-spec get_message_hmac_record(message()) -> resource_record().
 
 get_message_hmac_record(Message) ->
     DnsDigest = encode_message(Message),
@@ -160,27 +157,52 @@ get_message_hmac_record(Message) ->
     Mac = crypto:mac(hmac, sha256, <<"1\n">>, Digest),
     MacSize = byte_size(Mac),
 
-
     Rdata = <<11:8, "hmac-sha256", 0:8, Timepoint:48, Fudge:16, MacSize:16,
               Mac/binary, OriginalId:16, Error:16, OtherLen:16, Other/binary>>,
-    %RdLength = byte_size(Rdata),
-    %Tsig = <<9:8, "updatekey", 0:8, 250:16, 255:16, 0:32, RdLength:16, Rdata/binary>>,
-    Tsig = {"updatekey", 'TSIG', '*', 0, Rdata},
+    {"updatekey", 'TSIG', '*', 0, Rdata}.
 
-    Tsig.
+hmac_encode_message({QueryId, IsResponse, OpCode, IsAuthorative, IsTruncated,
+                     IsRecursionDesired, IsRecursionAvailable, Rcode, Questions,
+                     Answers, Authority, Additional}=Msg) ->
+    HmacRR = get_message_hmac_record(Msg),
+    encode_message({QueryId, IsResponse, OpCode, IsAuthorative, IsTruncated,
+                    IsRecursionDesired, IsRecursionAvailable, Rcode, Questions,
+                    Answers, Authority, Additional ++ [HmacRR]}).
 
-%-type message() :: {0..16#ffff, boolean(), 0..16#f, boolean(), boolean(), boolean(), boolean(), 0..16#f, [question()], [resource_record()], [resource_record()], [resource_record()]}.
+-type prerequisite() :: {use, name()}
+                      | {exists, name(), type()}
+                      | {exists, name(), type(), binary()}
+                      | {not_use, name()}
+                      | {not_exists, name(), type()}.
+
+-spec prerequisite_to_rr(name(), prerequisite()) -> resource_record().
+
+prerequisite_to_rr(_, {use, Name}) ->
+    {Name, '*', '*', 0, <<>>};
+prerequisite_to_rr(_, {exists, Name, Type}) ->
+    {Name, Type, '*', 0, <<>>};
+prerequisite_to_rr(ZoneClass, {exists, Name, Type, Binary}) ->
+    {Name, Type, ZoneClass, 0, Binary};
+prerequisite_to_rr(_, {not_use, Name}) ->
+    {Name, '*', 'NONE', 0, <<>>};
+prerequisite_to_rr(_, {not_exists, Name, Type}) ->
+    {Name, Type, 'NONE', 0, <<>>}.
+
+create_update_message({QueryId, ZoneName, ZoneClass, Prerequisites, Updates}) ->
+    {QueryId, false, 5, false, false, false, false, 0,
+     [{ZoneName, 'SOA', ZoneClass}],
+     [prerequisite_to_rr(ZoneClass, P) || P <- Prerequisites],
+     Updates,
+     []}.
+
 main(_) ->
     io:format("Ok~n", []),
     {ok, T} = gen_tcp:connect({127, 0, 0, 1}, 53, [{active, true}, binary, {packet, 2}]),
     QueryId = 1,
-    IsResponse = 0,
-    OpCode = 0,
-    Questions = [
-        {"xn--dpping-wxa.eu", 'TXT', 'IN'}
-    ],
-    Message = {1, false, 0, false, false, false, false, 0, Questions, [], [], []},
-    Msg = encode_message(Message),
+    Message = create_update_message(
+                {QueryId, "xn--dpping-wxa.eu", 'IN', [{not_exists, "hello-erlang.xn--dpping-wxa.eu", 'A'}],
+                 [{"hello-erlang-preq.xn--dpping-wxa.eu", 'A', 'IN', 3600, <<192, 168, 2, 4>>}]}),
+    Msg = hmac_encode_message(Message),
     io:format("~p", [Msg]),
     ok = gen_tcp:send(T, [Msg]),
     receive
